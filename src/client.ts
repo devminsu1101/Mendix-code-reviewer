@@ -3,10 +3,10 @@ import { config } from 'dotenv';
 config({ override: true });
 import { MendixPlatformClient, setPlatformConfig } from "mendixplatformsdk";
 
-export async function getModel() {
+export async function getModel(requestedBranch?: string) {
     const token = process.env.MENDIX_TOKEN;
     const appId = process.env.MENDIX_APP_ID;
-    const branchName = process.env.MENDIX_BRANCH || "main";
+    const branchName = requestedBranch || process.env.MENDIX_BRANCH || "main";
 
     if (!token || !appId) {
         throw new Error("❌ .env 파일에 MENDIX_TOKEN 또는 MENDIX_APP_ID가 없습니다!");

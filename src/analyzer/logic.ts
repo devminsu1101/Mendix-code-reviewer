@@ -102,13 +102,34 @@ function getMfFingerprint(mf: microflows.Microflow): string {
     return `${actions}#${entities}`;
 }
 
-export async function analyzeLogic(model: IModel): Promise<ReviewIssue[]> {
+export async function analyzeLogic(model: IModel, isDelta: boolean = false): Promise<ReviewIssue[]> {
+    const ONE_HOUR = 60 * 60 * 1000;
+    const now = Date.now();
+
     const allMfs = model.allMicroflows().filter(mf => {
         const mod = mf.qualifiedName.split(".")[0];
-        return mod !== "System" && mod !== "Administration";
+        const isSystem = mod === "System" || mod === "Administration";
+        if (isSystem) return false;
+
+        if (isDelta) {
+            // Delta 모드: 최근 1시간 내 수정된 것만 포함
+            // 참고: mf.containerAsFolder.structureTypeName 등으로 더 정교하게 필터 가능
+            // 여기서는 단순 날짜 비교 (SDK의 unit 특성 활용)
+            const lastModified = (mf as any).unit?.lastModifiedDate; 
+            if (lastModified) {
+                return (now - lastModified) < ONE_HOUR;
+            }
+            return true; // 날짜 정보 없으면 안전하게 포함
+        }
+        return true;
     });
 
-    console.log(`🔍 [Logic] 핵심 로직 및 성능/유사성 분석 시작... (대상: ${allMfs.length}건)`);
+    if (allMfs.length === 0) {
+        console.log(`🔍 [Logic] 분석할 변경된 로직이 없습니다.`);
+        return [];
+    }
+
+    console.log(`🔍 [Logic] ${isDelta ? "변경분" : "전체"} 분석 시작... (대상: ${allMfs.length}건)`);
     
     const allIssues: ReviewIssue[] = [];
     const fingerprintMap: Record<string, string[]> = {}; // { fingerprint: [mfNames] }

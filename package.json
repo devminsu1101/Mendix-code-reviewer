@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "review": "cross-env NODE_OPTIONS=--max-old-space-size=8192 tsx src/index.ts",
+    "server": "cross-env NODE_OPTIONS=--max-old-space-size=8192 tsx src/server.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -13,10 +14,12 @@
   "type": "module",
   "dependencies": {
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
     "mendixmodelsdk": "^4.110.0",
     "mendixplatformsdk": "^5.2.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "cross-env": "^10.1.0",
     "tsx": "^4.21.0"
   }

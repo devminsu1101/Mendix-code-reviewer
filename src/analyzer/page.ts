@@ -24,13 +24,31 @@ function processPage(page: pages.Page): ReviewIssue[] {
     return issues;
 }
 
-export async function analyzePage(model: IModel): Promise<ReviewIssue[]> {
+export async function analyzePage(model: IModel, isDelta: boolean = false): Promise<ReviewIssue[]> {
+    const ONE_HOUR = 60 * 60 * 1000;
+    const now = Date.now();
+
     const allPages = model.allPages().filter(p => {
         const mod = p.qualifiedName.split(".")[0];
-        return mod !== "System" && mod !== "Administration";
+        const isSystem = mod === "System" || mod === "Administration";
+        if (isSystem) return false;
+
+        if (isDelta) {
+            const lastModified = (p as any).unit?.lastModifiedDate; 
+            if (lastModified) {
+                return (now - lastModified) < ONE_HOUR;
+            }
+            return true;
+        }
+        return true;
     });
 
-    console.log(`🔍 [Page] ${allPages.length}개의 페이지 분석 시작 (병렬 처리)...`);
+    if (allPages.length === 0) {
+        console.log(`🔍 [Page] 분석할 변경된 페이지가 없습니다.`);
+        return [];
+    }
+
+    console.log(`🔍 [Page] ${isDelta ? "변경분" : "전체"} 분석 시작... (대상: ${allPages.length}건)`);
     
     const allIssues: ReviewIssue[] = [];
     const BATCH_SIZE = 10;

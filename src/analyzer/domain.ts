@@ -3,8 +3,8 @@ import { IModel, domainmodels } from "mendixmodelsdk";
 import { ReviewIssue } from "./reporter.js";
 import { MendixRules } from "./rules.js";
 
-export async function analyzeDomain(model: IModel): Promise<ReviewIssue[]> {
-    console.log("🔍 [Domain] 데이터 구조 및 모듈 간 의존성 분석 시작...");
+export async function analyzeDomain(model: IModel, isDelta: boolean = false): Promise<ReviewIssue[]> {
+    console.log(`🔍 [Domain] 데이터 구조 및 모듈 간 의존성 분석 시작... (${isDelta ? "Delta 모드" : "전체"})`);
     const domainModels = model.allDomainModels();
     const issues: ReviewIssue[] = [];
     
@@ -14,6 +14,12 @@ export async function analyzeDomain(model: IModel): Promise<ReviewIssue[]> {
     for (const dmProxy of domainModels) {
         const moduleName = dmProxy.containerAsModule.name;
         if (moduleName === "System" || moduleName === "Administration") continue;
+
+        if (isDelta) {
+            // 도메인은 변경된 엔티티가 포함된 모듈만 분석하거나, 
+            // Delta 모드일 때는 아키텍처 결합도 분석은 건너뛰는 식으로 성능 최적화 가능
+            // 여기서는 시그니처만 맞춤
+        }
 
         const dm = await dmProxy.load();
         

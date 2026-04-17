@@ -5,29 +5,25 @@ import { analyzeDomain } from "./analyzer/domain.js";
 import { analyzePage } from "./analyzer/page.js";
 import { generateReport, ReviewIssue } from "./analyzer/reporter.js";
 
-async function startReview() {
-    const branchName = process.env.MENDIX_BRANCH || "main";
-    console.log(`\n🚀 [${branchName}] 브랜치 분석을 시작합니다...`);
+export async function startReview(requestedBranch?: string, isDelta: boolean = false) {
+    const branchName = requestedBranch || process.env.MENDIX_BRANCH || "main";
+    console.log(`\n🚀 [${branchName}] 브랜치 분석을 시작합니다... (모드: ${isDelta ? "Delta" : "Full Audit"})`);
     console.log("🤖 Mendix Code Review Bot 가동!!!");
     console.time("소요 시간");
 
     try {
-        const { model, commitInfo } = await getModel();
+        const { model, commitInfo } = await getModel(branchName);
 
-        // 분석 결과 수집
-        const allIssues: ReviewIssue[] = [];
+        // 분석 결과 수집 및 병렬 실행
+        console.log(`\n🔍 분석(${isDelta ? "변경된 요소만" : "전체"})을 시작합니다...`);
+        
+        const [domainIssues, logicIssues, pageIssues] = await Promise.all([
+            analyzeDomain(model, isDelta),
+            analyzeLogic(model, isDelta),
+            analyzePage(model, isDelta)
+        ]);
 
-        // 1. 도메인 분석
-        const domainIssues = await analyzeDomain(model);
-        allIssues.push(...domainIssues);
-
-        // 2. 로직 분석
-        const logicIssues = await analyzeLogic(model);
-        allIssues.push(...logicIssues);
-
-        // 3. 페이지 분석
-        const pageIssues = await analyzePage(model);
-        allIssues.push(...pageIssues);
+        const allIssues: ReviewIssue[] = [...domainIssues, ...logicIssues, ...pageIssues];
 
         // 4. 리포트 생성
         console.log("\n📊 분석 결과 취합 및 보고서 생성 중...");
@@ -41,4 +37,7 @@ async function startReview() {
     }
 }
 
-startReview();
+// 직접 실행 시 (npm run review)
+if (process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js')) {
+    startReview();
+}
