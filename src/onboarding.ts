@@ -3,13 +3,16 @@ import { getModel } from "./client.js";
 import { generateAIGuide } from "./analyzer/onboarding_ai.js";
 
 async function runOnboarding() {
-    const requestedBranch = process.argv[2]; // 브랜치명을 인자로 받을 수 있음
+    const requestedBranch = process.argv[2];
     
     console.log("🚀 Mendix AI Onboarding 가이드 생성을 시작합니다...");
     console.time("소요 시간");
 
+    let model: any = null;
+
     try {
-        const { model, commitInfo } = await getModel(requestedBranch);
+        const { model: loadedModel, commitInfo } = await getModel(requestedBranch);
+        model = loadedModel;
         
         const guideText = await generateAIGuide(model, commitInfo.appName);
         
@@ -22,7 +25,7 @@ async function runOnboarding() {
         console.error("❌ 가이드 생성 중 에러 발생:", error);
     } finally {
         console.timeEnd("소요 시간");
-        process.exit(0);
+        // process.exit(0); // 자연스러운 종료를 위해 제거
     }
 }
 

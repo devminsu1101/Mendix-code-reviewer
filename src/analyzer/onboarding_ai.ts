@@ -1,60 +1,123 @@
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { IModel } from "mendixmodelsdk";
+import { IModel, domainmodels, navigation, security, microflows } from "mendixmodelsdk";
 import fs from "fs/promises";
 import path from "path";
 
 /**
- * Mendix 모델에서 AI 분석을 위한 핵심 메타데이터를 추출합니다.
+ * Mendix 모델에서 비즈니스 맥락, 사용자 흐름 및 기술 구조를 통합적으로 추출합니다.
  */
 async function extractMetadata(model: IModel) {
-    console.log("📊 프로젝트 내부 구조 정밀 분석 중...");
+    console.log("📊 프로젝트 마스터 분석 시작 (User Flow & Business Context)...");
 
-    // 1. 보안/유저 역할
+    const modules = model.allModules().filter(m => !["System", "Administration", "UnitTesting", "Atlas_Core", "Atlas_Web_Content"].includes(m.name));
+    
+    // 1. 유저 역할 및 페이지 접근 권한 분석 (페르소나 정의용)
     const allSecurities = model.allProjectSecurities();
-    let roles: any[] = [];
+    let userRoles: any[] = [];
     if (allSecurities.length > 0) {
         try {
-            const security = await allSecurities[0].load();
-            roles = security.userRoles.map(r => ({ name: r.name, desc: r.description }));
-        } catch (e) { console.log("⚠️ 보안 정보 로드 실패"); }
+            const projectSecurity = await allSecurities[0].load();
+            userRoles = projectSecurity.userRoles.map(r => ({
+                name: r.name,
+                description: r.description
+            }));
+        } catch (e) { console.log("⚠️ 보안 정보 추출 실패"); }
     }
 
-    // 2. 전체 모듈 및 엔티티 관계도 (상세 추출)
-    const modules = model.allModules()
-        .filter(m => !["System", "Administration", "UnitTesting"].includes(m.name))
-        .map(m => ({
-            name: m.name,
-            entities: m.domainModel.entities.map(e => ({
-                name: e.name,
-                associationCount: m.domainModel.associations.filter(a => 
-                    (a.parent && a.parent.name === e.name) || (a.child && a.child.name === e.name)
-                ).length,
-                attributes: e.attributes.length
-            }))
-        }));
-
-    // 3. 컨벤션 파악을 위한 마이크로플로우/페이지 전체 리스트
-    const mfSamples = model.allMicroflows().map(mf => mf.qualifiedName);
-    const pageSamples = model.allPages().map(p => p.qualifiedName);
-
-    // 4. 네비게이션 진입점
-    let homePage = "Unknown";
-    try {
-        const navDocs = (model as any).allNavigationDocuments?.() || [];
-        if (navDocs.length > 0) {
+    // 2. 네비게이션 분석 (시스템 진입점 및 유저 플로우 파악)
+    const navDocs = model.allNavigationDocuments();
+    let entryPoints: any[] = [];
+    if (navDocs.length > 0) {
+        try {
             const nav = await navDocs[0].load();
-            if (nav.profiles && nav.profiles.length > 0) {
-                homePage = nav.profiles[0].homePage?.qualifiedName || "Unknown";
-            }
-        }
-    } catch (e) { console.log("⚠️ 네비게이션 로드 실패"); }
+            nav.profiles.forEach(profile => {
+                if (profile.homePage) {
+                    entryPoints.push({
+                        profile: profile.name,
+                        homePage: profile.homePage.qualifiedName,
+                        menuItems: profile.menuItemCollection?.items.slice(0, 5).map(item => item.caption) || []
+                    });
+                }
+            });
+        } catch (e) { console.log("⚠️ 네비게이션 분석 실패"); }
+    }
 
-    return { roles, homePage, modules, conventions: { microflows: mfSamples, pages: pageSamples } };
+    // 3. 엔티티 관계 및 모듈 의존성 (기존 로직 고도화)
+    const entityRelationships: any[] = [];
+    const moduleDependencyMap: Record<string, Set<string>> = {};
+    const moduleStats: Record<string, { internalRel: number, externalRel: number, entities: string[] }> = {};
+
+    modules.forEach(m => {
+        moduleStats[m.name] = { internalRel: 0, externalRel: 0, entities: m.domainModel.entities.map(e => e.name) };
+
+        m.domainModel.associations.forEach(assoc => {
+            if (assoc.parent && assoc.child) {
+                const parentModule = (assoc.parent.container as domainmodels.DomainModel).containerAsModule.name;
+                const childModule = (assoc.child.container as domainmodels.DomainModel).containerAsModule.name;
+                const isInternal = parentModule === childModule;
+
+                entityRelationships.push({
+                    from: `${parentModule}.${assoc.parent.name}`,
+                    to: `${childModule}.${assoc.child.name}`,
+                    type: isInternal ? "Internal" : "External",
+                    label: assoc.name
+                });
+
+                if (isInternal) moduleStats[m.name].internalRel++;
+                else {
+                    moduleStats[m.name].externalRel++;
+                    if (!moduleDependencyMap[parentModule]) moduleDependencyMap[parentModule] = new Set();
+                    moduleDependencyMap[parentModule].add(childModule);
+                }
+            }
+        });
+
+        // 상속 관계
+        m.domainModel.entities.forEach(entity => {
+            if (entity.generalization && (entity.generalization as any).generalization) {
+                const parentEntity = (entity.generalization as any).generalization;
+                const parentModule = (parentEntity.container as domainmodels.DomainModel).containerAsModule.name;
+                entityRelationships.push({
+                    from: `${m.name}.${entity.name}`,
+                    to: `${parentModule}.${parentEntity.name}`,
+                    type: "Inheritance",
+                    label: "is-a"
+                });
+            }
+        });
+    });
+
+    // 4. 로직 분석 (마이크로플로우 명명 패턴 및 주요 액션 샘플링)
+    const allDocs = model.allDocuments();
+    const moduleAnalysis = modules.map(m => {
+        const moduleDocs = allDocs.filter(doc => {
+            const parts = doc.qualifiedName.split(".");
+            return parts.length > 0 && parts[0] === m.name;
+        });
+
+        return {
+            name: m.name,
+            stats: moduleStats[m.name],
+            structureSample: moduleDocs.slice(0, 15).map(d => ({
+                name: d.name,
+                qName: d.qualifiedName,
+                type: d.constructor.name
+            }))
+        };
+    });
+
+    return {
+        userRoles,
+        entryPoints,
+        moduleAnalysis,
+        entityRelationships: entityRelationships.slice(0, 60), // AI 인지 한계 고려
+        moduleDependencies: Object.fromEntries(Object.entries(moduleDependencyMap).map(([k, v]) => [k, Array.from(v)]))
+    };
 }
 
 /**
- * Gemini 최신 모델을 사용하여 정밀 온보딩 가이드를 생성합니다.
+ * 통합 마스터 온보딩 가이드를 생성합니다.
  */
 export async function generateAIGuide(model: IModel, appName: string) {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -63,66 +126,62 @@ export async function generateAIGuide(model: IModel, appName: string) {
     const metadata = await extractMetadata(model);
     const genAI = new GoogleGenerativeAI(apiKey);
     
-    // 사용자님이 확인하신 실제 작동 모델 리스트
-    const modelCandidates = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-3-flash", 
-        // "gemini-3.1-flash-lite",
-    ];
+    const modelCandidates = ["gemini-2.5-flash", "gemini-3-flash"];
 
     const prompt = `
         너는 10년 차 Mendix 전문 시니어 개발자이자 기술 리드야. 
-        우리 팀에 새로 합류한 신입 개발자를 위해, 아래 제공된 **실제 프로젝트 메타데이터**를 바탕으로 아주 상세하고 전문적인 '온보딩 가이드'를 작성해줘.
+        신입 개발자가 3일 안에 실무에 투입될 수 있도록, 비즈니스 맥락과 코드의 연결고리를 짚어주는 **[통합 마스터 온보딩 가이드]**를 작성해줘.
 
-        [분석 대상 프로젝트 정보]
-        - 애플리케이션 이름: ${appName || "RamsesKR (Logistics System)"}
-        - 시작 페이지 (Home): ${metadata.homePage}
-        - 유저 역할 및 권한: ${JSON.stringify(metadata.roles)}
-        - 전체 모듈 구조 및 엔티티 복잡도: ${JSON.stringify(metadata.modules)}
-        - 마이크로플로우/페이지 명명 패턴: ${JSON.stringify(metadata.conventions)}
+        [분석된 프로젝트 원재료]
+        1. **사용자 페르소나**: ${JSON.stringify(metadata.userRoles)}
+        2. **시스템 진입점(Navigation)**: ${JSON.stringify(metadata.entryPoints)}
+        3. **비즈니스 모듈 구조**: ${JSON.stringify(metadata.moduleAnalysis)}
+        4. **데이터 관계망(ER-Map)**: ${JSON.stringify(metadata.entityRelationships)}
+        5. **모듈 간 의존성**: ${JSON.stringify(metadata.moduleDependencies)}
 
-        [가이드 작성 요구사항 - 매우 상세하게 작성할 것]
-        1. **서론**: 팀 리더로서 아주 따뜻하고 든든하게 환영 인사를 건네줘.
-        2. **비즈니스 도메인 해석**: 추출된 모듈명(예: Shipment, Quotation, Warehouse 등)과 엔티티들을 보고, 이 앱이 정확히 어떤 비즈니스 프로세스를 처리하는 앱인지 시니어의 통찰력을 담아 설명해줘.
-        3. **데이터 구조 마스터하기**: 
-           - 'associationCount'가 가장 높은 엔티티를 찾아 "이것이 우리 앱의 핵심(Heart)이다"라고 강조해줘.
-           - 해당 엔티티를 수정할 때 어떤 사이드 이펙트를 조심해야 하는지 기술적으로 조언해줘.
-        4. **우리 팀의 약속 (Convention)**:
-           - 제공된 마이크로플로우와 페이지 샘플을 분석해서 'ACT_', 'DS_', 'SUB_', 'NP_' 등 접두어별 의미와 사용 규칙을 정리해줘.
-           - 파일 경로 구조(Module > Folder > Document)에 대해서도 언급해줘.
-        5. **학습 로드맵 추천**: 신입 개발자가 어떤 모듈의 도메인 모델부터 열어봐야 할지, 어떤 마이크로플로우를 먼저 분석하면 흐름 파악이 빠를지 구체적으로 1단계, 2단계로 나누어 추천해줘.
-        6. **시니어의 꿀팁**: Mendix 개발 시 성능 최적화(Retrieve 관리 등)나 협업 시 주의사항을 우리 프로젝트 맥락에 맞춰서 말해줘.
-        7. **결론**: 신입의 성장을 응원하는 메시지로 마무리해줘.
+        [가이드 구성 요구사항 - 다음 순서를 엄격히 지킬 것]
 
-        [주의사항] 
-        - 모든 내용은 한국어로 작성해줘. 
-        - Markdown 서식을 활용하여 가독성 있게 작성할 것 (표, 불렛포인트, 코드 블럭 활용).
-        - 데이터에 없는 내용은 지어내지 말고, 데이터에 기반한 '추론'임을 밝히며 설명할 것.
+        ### 1단계: 비즈니스 지도 - "우리가 해결하는 문제"
+        - 단순히 엔티티 나열이 아니라, **사용자 페르소나**와 **네비게이션 메뉴**를 결합해서 설명해줘.
+        - "고객이 견적을 요청하면 -> 운영자가 확정하고 -> 창고에서 출고된다"는 식의 **데이터 생애주기 파이프라인**을 한 문장으로 정의해줘.
+
+        ### 2단계: 시스템 지도 - "코드의 뼈대와 흐름"
+        - **데이터의 심장**: 관계망에서 교량 역할을 하는 핵심 엔티티를 짚어주고, 왜 그 엔티티가 비즈니스의 중심인지 설명해줘.
+        - **의존성 흐름**: 모듈 간 의존 관계를 바탕으로 "상위 도메인"과 "하위 유틸리티/API 모듈"을 구분해서 아키텍처를 그려줘.
+        - **추적 가이드**: "사용자가 특정 버튼을 눌렀을 때(Entry Point) 어떤 모듈의 로직이 실행되는지" 예시 시나리오를 하나 만들어줘.
+
+        ### 3단계: 실무 치트시트 - "내일 당장 코딩할 때"
+        - **명명 규칙 & 폴더링**: 분석된 'structureSample'을 바탕으로 우리 팀의 명명 패턴(ACT, DS, SUB 등)과 문서 관리 규칙을 표로 정리해줘.
+        - **가드레일**: Mendix 성능 최적화(루프 내 Retrieve 금지 등)와 이 프로젝트에서 특히 조심해야 할 '위험 엔티티'를 경고해줘.
+
+        ### 4단계: 3일 완성 생존 로드맵 - "Actionable Mission"
+        - **Day 1 (탐험)**: 특정 페이지와 마이크로플로우를 직접 열어보고 데이터 흐름을 추적해보는 미션.
+        - **Day 2 (분석)**: 핵심 엔티티(\`ShipmentCase\` 등)의 연관 관계가 실제 화면에 어떻게 뿌려지는지 파악하는 미션.
+        - **Day 3 (응용)**: 작은 유효성 검사 로직을 추가해보거나 UI 스니펫을 분석해보는 미션.
+
+        [톤앤매너]
+        - 시니어 개발자가 직접 옆에서 가르쳐주는 듯한 친절하고 전문적인 말투.
+        - "추측건대"라는 말보다는 데이터에 기반한 "이런 구조이므로 ~인 것이 확실하다"는 확신 있는 어조.
+        - 모든 내용은 한국어로, Markdown 형식을 최대한 활용.
     `;
 
     for (const modelName of modelCandidates) {
         try {
-            console.log(`🤖 [${modelName}] 모델로 정밀 가이드 생성 시도 중...`);
+            console.log(`🤖 [${modelName}] 모델로 통합 마스터 가이드 생성 중...`);
             const aiModel = genAI.getGenerativeModel({ model: modelName });
-            
             const result = await aiModel.generateContent(prompt);
             const text = result.response.text();
 
             const reportDir = path.join(process.cwd(), "reports", "Onboarding");
             await fs.mkdir(reportDir, { recursive: true });
-            const fileName = `Onboarding_Guide_Full_${new Date().toISOString().replace(/[:.]/g, "-")}.md`;
+            const fileName = `Master_Onboarding_Guide_${new Date().toISOString().replace(/[:.]/g, "-")}.md`;
             const filePath = path.join(reportDir, fileName);
             await fs.writeFile(filePath, text, "utf8");
 
-            console.log(`\n✨ 정밀 온보딩 가이드 생성 성공! [사용 모델: ${modelName}]`);
-            console.log(`📍 저장 경로: ${filePath}`);
             return text;
-
         } catch (error: any) {
             console.log(`❌ [${modelName}] 시도 실패 (다음 모델로 전환)`);
         }
     }
-
-    throw new Error("❌ 모든 최신 모델 호출에 실패했습니다.");
+    throw new Error("❌ 가이드 생성에 실패했습니다.");
 }
