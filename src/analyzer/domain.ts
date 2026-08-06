@@ -2,7 +2,7 @@
 import { IModel, domainmodels, security } from "mendixmodelsdk";
 import { ReviewIssue } from "./issue.js";
 import { MendixRules } from "./rules.js";
-import { ModelGraph } from "./graph.js";
+import { isPersistableEntity, ModelGraph } from "./graph.js";
 
 const SYSTEM_MODULES = new Set(["System", "Administration"]);
 
@@ -19,12 +19,8 @@ async function readSecurityLevel(model: IModel): Promise<security.SecurityLevel 
     return null;
 }
 
-function isPersistable(entity: domainmodels.Entity): boolean {
-    const gen = entity.generalization;
-    if (gen instanceof domainmodels.NoGeneralization) return gen.persistable;
-    // 상속 엔티티는 부모의 persistable을 따른다. 여기서는 판단하지 않는다.
-    return true;
-}
+/** graph.ts와 판정이 갈리면 D003과 L001이 서로 다른 얘기를 하게 된다. 한 곳에서 가져온다. */
+const isPersistable = isPersistableEntity;
 
 export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<ReviewIssue[]> {
     console.log("🔍 [Domain] 데이터 구조·보안·의존성 분석 시작...");
@@ -42,7 +38,9 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
         message: string,
         severity: "Warning" | "Error",
         evidence: string[],
-        scoreOverride?: number
+        scoreOverride?: number,
+        /** 룰 기본 권장문구가 이 상황에 안 맞을 때 덮어쓴다. */
+        recommendationOverride?: string
     ) => {
         const rule = MendixRules[ruleKey];
         issues.push({
@@ -50,7 +48,7 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
             ruleId: rule.id,
             location,
             message,
-            recommendation: rule.recommendation,
+            recommendation: recommendationOverride ?? rule.recommendation,
             severity,
             evidence,
             score: scoreOverride ?? rule.baseScore,
@@ -118,15 +116,77 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                 );
             }
 
-            // D003 — 인덱스 누락
-            if (entity.attributes.length > 20 && entity.indexes.length === 0) {
-                add(
-                    "MISSING_INDEX",
-                    qName,
-                    `속성 ${entity.attributes.length}개인 대형 엔티티에 인덱스가 없습니다.`,
-                    "Warning",
-                    [usageLine]
-                );
+            // D003 — 조회 키 인덱스 누락
+            //
+            // 예전 기준은 "속성 20개 초과 + 인덱스 0개"라는 대리 지표였다. 그래서
+            // (1) 비영속 엔티티까지 걸렸고 (2) **어느 속성에 걸라는 말을 못 했다.**
+            // 이제 실제 XPath에서 뽑은 조회 키를 근거로 지목한다.
+            const indexInfo = graph.entityIndexes.get(qName);
+            const queryKeys = graph.entityQueryKeys.get(qName);
+            if (isPersistable(entity) && queryKeys && queryKeys.size > 0) {
+                // leftmost prefix: 복합 인덱스의 2번째 이후 속성은 단독 조회를 받쳐주지 않는다.
+                const covered = indexInfo?.leadingAttrs ?? new Set<string>();
+                const uncovered = [...queryKeys.entries()]
+                    .filter(([attr]) => !covered.has(attr))
+                    .sort(
+                        (a, b) =>
+                            b[1].inLoop - a[1].inLoop ||
+                            b[1].hotFlows.size - a[1].hotFlows.size ||
+                            b[1].total - a[1].total ||
+                            a[0].localeCompare(b[0])
+                    );
+
+                if (uncovered.length > 0) {
+                    const inLoop = uncovered.reduce((sum, [, u]) => sum + u.inLoop, 0);
+                    const hotFlows = new Set(
+                        uncovered.flatMap(([, u]) => [...u.hotFlows])
+                    );
+                    const orCombined = uncovered.some(([, u]) => u.orCombined);
+
+                    const detail = uncovered
+                        .slice(0, 6)
+                        .map(([attr, u]) => {
+                            const parts = [`${u.total}곳`];
+                            if (u.inLoop > 0) parts.push(`루프 내 ${u.inLoop}곳`);
+                            if (u.hotFlows.size > 0) parts.push(`무인/외부 ${u.hotFlows.size}곳`);
+                            return `${attr}(${parts.join(", ")})`;
+                        })
+                        .join(", ");
+
+                    const evidence = [
+                        indexInfo && indexInfo.count > 0
+                            ? `인덱스 ${indexInfo.count}개 있음 — 선두 속성: ${[...indexInfo.leadingAttrs].join(", ") || "(없음)"}`
+                            : `이 엔티티에 인덱스 정의가 없습니다.`,
+                        usageLine,
+                    ];
+                    if (inLoop > 0) {
+                        evidence.push(
+                            `루프 안에서 쓰이는 조회 키가 있습니다 — 인덱스 부재 비용이 반복 횟수만큼 곱해집니다. (L001 참조)`
+                        );
+                    }
+                    if (hotFlows.size > 0) {
+                        evidence.push(
+                            `무인/외부 진입 경로 flow: ${[...hotFlows].slice(0, 3).join(", ")}`
+                        );
+                    }
+
+                    add(
+                        "MISSING_INDEX",
+                        qName,
+                        `조회 조건으로 쓰이는 속성 ${uncovered.length}개가 인덱스로 커버되지 않습니다: ${detail}${uncovered.length > 6 ? " 외" : ""}`,
+                        // 루프 안이거나 무인/외부 경로면 비용이 반복·빈도만큼 곱해진다.
+                        inLoop > 0 || hotFlows.size > 0 ? "Error" : "Warning",
+                        evidence,
+                        MendixRules.MISSING_INDEX.baseScore + inLoop * 5 + hotFlows.size * 3,
+                        orCombined
+                            ? "조회 조건이 `or`로 묶여 있습니다. 복합 인덱스는 `or`에 쓰이지 않으므로 " +
+                                  "**각 속성에 단일 컬럼 인덱스를 따로** 만드세요. " +
+                                  "String 속성은 Max length가 Unlimited면 인덱스를 걸 수 없습니다."
+                            : "엔티티 Properties → Indexes 탭에서 위 속성에 인덱스를 추가하세요. " +
+                                  "여러 속성이 항상 함께 조건에 쓰이면 선택도 높은 것을 앞에 둔 복합 인덱스가 낫습니다(leftmost prefix). " +
+                                  "String 속성은 Max length가 Unlimited면 인덱스를 걸 수 없습니다."
+                    );
+                }
             }
 
             // D004/D005 — 접근 규칙 (보안이 켜져 있을 때만 의미 있음)

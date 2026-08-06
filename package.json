@@ -8,7 +8,7 @@
     "server": "cross-env NODE_OPTIONS=--max-old-space-size=8192 tsx src/server.ts",
     "guide": "cross-env NODE_OPTIONS=--max-old-space-size=8192 tsx src/onboarding.ts",
     "selfcheck": "tsx src/selfcheck.ts",
-    "test": "tsx src/selfcheck.ts && tsx src/blame.test.ts"
+    "test": "tsx src/selfcheck.ts && tsx src/blame.test.ts && tsx src/xpath.test.ts"
   },
   "keywords": [],
   "author": "",

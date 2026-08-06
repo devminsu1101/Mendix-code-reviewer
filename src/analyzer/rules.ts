@@ -11,9 +11,13 @@ export const MendixRules: Record<string, BestPractice> = {
     // ── 로직(Logic) ──────────────────────────────────────────────
     LOOP_DB_RETRIEVE: {
         id: "L001",
-        description: "루프 내부에서 데이터베이스 Retrieve를 수행하면 N+1 쿼리가 발생합니다.",
+        description:
+            "루프 내부에서 데이터베이스 Retrieve를 수행하면 N+1 쿼리가 발생합니다. " +
+            "Range를 First(단건)로 두어도 쿼리 **횟수**는 줄지 않습니다 — 줄어드는 것은 " +
+            "결과 전송·객체화 비용뿐이고, 지배적인 비용은 반복마다 발생하는 DB 왕복입니다.",
         recommendation:
-            "루프 진입 전에 필요한 리스트를 한 번에 Retrieve하고, 루프 안에서는 'Find by expression'으로 메모리상에서 찾으세요.",
+            "루프 진입 전에 필요한 리스트를 한 번에 Retrieve하고, 루프 안에서는 'Find by expression'으로 메모리상에서 찾으세요. " +
+            "다만 반복 횟수가 입력 크기로 묶여 있다면 구조 변경보다 조회 키 인덱스(D003)가 먼저입니다.",
         target: "0건",
         baseScore: 40,
     },
@@ -95,10 +99,14 @@ export const MendixRules: Record<string, BestPractice> = {
     },
     MISSING_INDEX: {
         id: "D003",
-        description: "대량 데이터를 가진 엔티티에 인덱스가 없으면 조회 쿼리가 매우 느려집니다.",
+        description:
+            "XPath 조회 조건으로 실제 사용되는 속성에 인덱스가 없으면 매 조회가 풀스캔이 됩니다. " +
+            "특히 '존재하지 않는 행'을 찾는 조회는 끝까지 스캔한 뒤에야 빈 결과를 돌려주므로 " +
+            "Range를 First로 두어도 비용이 줄지 않습니다.",
         recommendation:
-            "주로 검색 조건으로 사용되는 Attribute(ID, 날짜, 구분코드)에 Index를 추가하세요.",
-        target: "필수 적용",
+            "엔티티 Properties → Indexes 탭에서 조회 키 속성에 인덱스를 추가하세요. " +
+            "`or` 결합 조건은 복합 인덱스가 쓰이지 않으므로 단일 컬럼 인덱스를 각각 만들어야 합니다.",
+        target: "조회 키 전량 커버",
         baseScore: 15,
     },
     NO_ACCESS_RULE: {

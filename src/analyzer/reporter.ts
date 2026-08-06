@@ -103,6 +103,70 @@ function renderRuleSummary(issues: ReviewIssue[]): string {
     return out;
 }
 
+/**
+ * 인덱스가 필요한 속성을 엔티티별로 모아 **작업 지시서 형태**로 낸다.
+ *
+ * 왜 별도 섹션인가: 근거(evidence)는 TOP 10에만 렌더링되는데, 인덱스 문제는
+ * 개별 결함으로는 점수가 낮아 상단에 잘 안 올라온다. 그런데 이건 한 엔티티에 모아 놓고
+ * 한 번에 처리하는 게 맞는 종류의 작업이라, 순위와 별개로 통째로 보여줘야 쓸모가 있다.
+ *
+ * D003이 지적한 엔티티만 대상으로 한다. 룰과 다른 얘기를 하면 리포트가 신뢰를 잃는다.
+ */
+function renderIndexPlan(issues: ReviewIssue[], graph: ModelGraph): string {
+    const flagged = issues
+        .filter((i) => i.ruleId === "D003")
+        .sort((a, b) => b.score - a.score || a.location.localeCompare(b.location));
+
+    if (flagged.length === 0) return `인덱스가 필요한 조회 키가 발견되지 않았습니다.\n`;
+
+    let out =
+        `XPath 조회 조건에 실제로 쓰이는데 인덱스로 커버되지 않는 속성입니다. ` +
+        `Studio Pro에서 엔티티 **Properties → Indexes** 탭에 추가하세요.\n\n` +
+        `> String 속성은 **Max length가 Unlimited면 인덱스를 걸 수 없습니다.** 길이를 먼저 지정해야 합니다.\n` +
+        `> 인덱스는 insert/update마다 갱신 비용이 붙습니다. 아래 목록은 후보이지 전량 적용 대상이 아닙니다.\n\n`;
+
+    for (const issue of flagged) {
+        const info = graph.entityIndexes.get(issue.location);
+        const keys = graph.entityQueryKeys.get(issue.location);
+        if (!keys) continue;
+
+        const covered = info?.leadingAttrs ?? new Set<string>();
+        const uncovered = [...keys.entries()]
+            .filter(([attr]) => !covered.has(attr))
+            .sort(
+                (a, b) =>
+                    b[1].inLoop - a[1].inLoop ||
+                    b[1].hotFlows.size - a[1].hotFlows.size ||
+                    b[1].total - a[1].total ||
+                    a[0].localeCompare(b[0])
+            );
+        if (uncovered.length === 0) continue;
+
+        const indexState =
+            info && info.count > 0
+                ? `기존 인덱스 ${info.count}개 (선두 속성: ${[...info.leadingAttrs].join(", ") || "없음"})`
+                : `기존 인덱스 없음`;
+
+        out += `### \`${issue.location}\` — ${indexState}\n\n`;
+        out += `| 속성 | 조회 | 루프 내 | 무인/외부 |\n| :--- | ---: | ---: | ---: |\n`;
+        for (const [attr, usage] of uncovered) {
+            out += `| \`${attr}\` | ${usage.total} | ${usage.inLoop || "-"} | ${usage.hotFlows.size || "-"} |\n`;
+        }
+
+        const orCombined = uncovered.some(([, u]) => u.orCombined);
+        // 속성이 하나뿐인데 "복합 인덱스를 고려하라"고 하면 말이 안 된다.
+        const note =
+            uncovered.length === 1
+                ? "이 속성에 단일 컬럼 인덱스를 추가하세요."
+                : orCombined
+                  ? "조회 조건이 `or`로 묶여 있습니다. **복합 인덱스는 `or`에 쓰이지 않으므로 각 속성에 단일 컬럼 인덱스를 따로** 만드세요."
+                  : "여러 속성이 항상 함께 조건에 쓰인다면 선택도 높은 것을 앞에 둔 복합 인덱스가 낫습니다(leftmost prefix).";
+        out += `\n> ${note}\n\n`;
+    }
+
+    return out;
+}
+
 function renderModuleHealth(issues: ReviewIssue[], graph: ModelGraph): string {
     const stats = new Map<string, { errors: number; warnings: number; score: number; flows: number }>();
     const ensure = (m: string) => {
@@ -219,6 +283,10 @@ export async function generateReport(
         content += `머지 커밋으로 찍힌 경우 실제 작성은 소스 브랜치에서 이뤄졌을 수 있습니다.\n\n`;
     }
     content += renderTopIssues(sorted, 10, blame);
+
+    content += `## 🔑 인덱스가 필요한 속성\n\n`;
+    content += renderIndexPlan(sorted, graph);
+    content += `\n`;
 
     content += `## 📋 규칙별 집계\n\n`;
     content += renderRuleSummary(sorted);
