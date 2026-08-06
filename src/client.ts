@@ -3,6 +3,27 @@ import { config } from 'dotenv';
 config({ override: true });
 import { MendixPlatformClient, setPlatformConfig } from "mendixplatformsdk";
 
+/** 인증 설정 후 App 객체를 돌려준다. getModel과 blame이 공유한다. */
+export function getApp() {
+    const token = process.env.MENDIX_TOKEN;
+    const appId = process.env.MENDIX_APP_ID;
+    if (!token || !appId) {
+        throw new Error("❌ .env 파일에 MENDIX_TOKEN 또는 MENDIX_APP_ID가 없습니다!");
+    }
+    setPlatformConfig({ mendixToken: token });
+    return { app: new MendixPlatformClient().getApp(appId), appId };
+}
+
+/**
+ * 특정 커밋 시점의 모델을 연다. blame(귀속 추적)에서 과거로 거슬러 갈 때 쓴다.
+ * 진행 로그를 찍지 않는다 — 수십 번 호출되므로 콘솔이 묻힌다.
+ */
+export async function getModelAtCommit(branchName: string, commitId: string) {
+    const { app } = getApp();
+    const workingCopy = await app.createTemporaryWorkingCopy(branchName, { commitId });
+    return await workingCopy.openModel();
+}
+
 export async function getModel(requestedBranch?: string) {
     const token = process.env.MENDIX_TOKEN;
     const appId = process.env.MENDIX_APP_ID;
@@ -47,7 +68,9 @@ export async function getModel(requestedBranch?: string) {
         return {
             model,
             commitInfo: {
-                appName: app.name, // 앱 이름 추가
+                // Platform SDK의 App에는 name이 없다(appId만 있음).
+                // 리포트 폴더가 매번 "UnknownApp"이 되던 원인. 이름을 쓰려면 .env에 지정한다.
+                appName: process.env.MENDIX_APP_NAME || appId,
                 branch: branchName,
                 author: authorName,
                 date: commitDate,

@@ -18,8 +18,9 @@ app.post('/webhook/mendix', async (req, res) => {
     res.status(202).json({ message: "리뷰가 시작되었습니다." });
 
     try {
-        // Delta 모드로 실행 (추후 구현)
-        await startReview(branch, true);
+        // 증분 리뷰는 스냅샷 diff 기반으로 별도 구현 예정(NEXT.md STEP 3/4).
+        // 시간 기반 추측은 실제로 동작하지 않아 제거했다. 지금은 전수 리뷰.
+        await startReview(branch);
     } catch (error) {
         console.error("❌ Webhook 리뷰 중 에러 발생:", error);
     }

@@ -1,73 +1,118 @@
 // src/analyzer/page.ts
-import { pages, IModel } from "mendixmodelsdk";
-import { ReviewIssue } from "./reporter.js";
+import { pages, IModel, security } from "mendixmodelsdk";
+import { ReviewIssue } from "./issue.js";
+import { MendixRules } from "./rules.js";
+import { ModelGraph } from "./graph.js";
+
+const SYSTEM_MODULES = new Set(["System", "Administration"]);
 
 /**
- * 개별 페이지 분석 로직
+ * **페이지 하나만으로** 판정 가능한 룰들. blame이 과거 커밋에서 재현할 수 있도록 분리해 둔다.
  */
-function processPage(page: pages.Page): ReviewIssue[] {
-    const issues: ReviewIssue[] = [];
-    const moduleName = page.qualifiedName.split('.')[0];
-    const location = `${moduleName}.${page.name}`;
+export function detectPageIssues(page: pages.Page, securityIsOn: boolean): PageRuleHit[] {
+    const hits: PageRuleHit[] = [];
 
-    // 1. 페이지 타이틀 검사 (사용자 경험 핵심)
-    if (!page.title || (page.title.items && page.title.items.length === 0)) {
-        issues.push({ 
-            category: 'Page', 
-            location, 
-            message: `⚠️ [디자인 결함] 페이지 타이틀이 설정되지 않았습니다.`, 
-            recommendation: "사용자가 현재 어떤 화면에 있는지 알 수 있도록 Page Title을 입력하세요.",
-            severity: 'Warning' 
+    // P001 — 타이틀 누락
+    // Text는 언어별 Translation 목록을 들고 있다. 번역이 없거나 전부 공백이면 타이틀이 없는 것.
+    const titleIsEmpty =
+        !page.title ||
+        page.title.translations.length === 0 ||
+        page.title.translations.every((t) => !t.text || t.text.trim() === "");
+    if (titleIsEmpty) {
+        hits.push({
+            ruleKey: "NO_PAGE_TITLE",
+            category: "Page",
+            message: `페이지 타이틀이 비어 있습니다.`,
+            severity: "Warning",
+            evidence: [],
         });
     }
 
-    return issues;
-}
-
-export async function analyzePage(model: IModel, isDelta: boolean = false): Promise<ReviewIssue[]> {
-    const ONE_HOUR = 60 * 60 * 1000;
-    const now = Date.now();
-
-    const allPages = model.allPages().filter(p => {
-        const mod = p.qualifiedName.split(".")[0];
-        const isSystem = mod === "System" || mod === "Administration";
-        if (isSystem) return false;
-
-        if (isDelta) {
-            const lastModified = (p as any).unit?.lastModifiedDate; 
-            if (lastModified) {
-                return (now - lastModified) < ONE_HOUR;
-            }
-            return true;
-        }
-        return true;
-    });
-
-    if (allPages.length === 0) {
-        console.log(`🔍 [Page] 분석할 변경된 페이지가 없습니다.`);
-        return [];
+    // P002 — 접근 역할 미지정 (보안이 켜져 있을 때만 의미 있음)
+    if (securityIsOn && page.allowedRoles.length === 0) {
+        hits.push({
+            ruleKey: "PAGE_NO_ROLES",
+            category: "Security",
+            message: `허용된 모듈 역할이 지정되지 않았습니다.`,
+            severity: "Error",
+            evidence: ["보안이 켜진 상태에서 역할 미지정 페이지는 접근 정책이 불명확합니다."],
+        });
     }
 
-    console.log(`🔍 [Page] ${isDelta ? "변경분" : "전체"} 분석 시작... (대상: ${allPages.length}건)`);
-    
-    const allIssues: ReviewIssue[] = [];
+    return hits;
+}
+
+export interface PageRuleHit {
+    ruleKey: keyof typeof MendixRules;
+    category: "Page" | "Security";
+    message: string;
+    severity: "Warning" | "Error";
+    evidence: string[];
+}
+
+function processPage(page: pages.Page, securityIsOn: boolean): ReviewIssue[] {
+    const location = page.qualifiedName ?? page.name;
+    return detectPageIssues(page, securityIsOn).map((hit) => {
+        const rule = MendixRules[hit.ruleKey];
+        return {
+            category: hit.category,
+            ruleId: rule.id,
+            location,
+            message: hit.message,
+            recommendation: rule.recommendation,
+            severity: hit.severity,
+            evidence: hit.evidence.length > 0 ? hit.evidence : undefined,
+            score: rule.baseScore,
+        };
+    });
+}
+
+async function readSecurityIsOn(model: IModel): Promise<boolean> {
+    for (const proxy of model.allProjectSecurities()) {
+        try {
+            const sec = await proxy.load();
+            return sec.securityLevel !== security.SecurityLevel.CheckNothing;
+        } catch {
+            /* 무시 */
+        }
+    }
+    return false;
+}
+
+export async function analyzePage(model: IModel, graph: ModelGraph): Promise<ReviewIssue[]> {
+    const securityIsOn = await readSecurityIsOn(model);
+
+    const allPages = model.allPages().filter((p) => {
+        const mod = (p.qualifiedName ?? "").split(".")[0];
+        return !SYSTEM_MODULES.has(mod) && !graph.excludedModules.has(mod);
+    });
+
+    console.log(`🔍 [Page] 분석 시작... (대상: ${allPages.length}건)`);
+
+    const issues: ReviewIssue[] = [];
+    const failures: string[] = [];
     const BATCH_SIZE = 10;
 
     for (let i = 0; i < allPages.length; i += BATCH_SIZE) {
         const batch = allPages.slice(i, i + BATCH_SIZE);
-        const results = await Promise.all(batch.map(async (pageProxy) => {
-            try {
-                const loadedPage = await pageProxy.load();
-                return processPage(loadedPage);
-            } catch (err) {
-                console.error(`❌ ${pageProxy.qualifiedName} 로드 실패`);
-                return [];
-            }
-        }));
-        results.forEach(res => allIssues.push(...res));
-        console.log(`   > 진행률: ${Math.min(i + BATCH_SIZE, allPages.length)} / ${allPages.length}`);
+        const results = await Promise.all(
+            batch.map(async (proxy) => {
+                try {
+                    return processPage(await proxy.load(), securityIsOn);
+                } catch (err) {
+                    failures.push(`${proxy.qualifiedName}: ${(err as Error).message}`);
+                    return [];
+                }
+            })
+        );
+        for (const res of results) issues.push(...res);
     }
 
-    console.log(`✅ 페이지 분석 완료 (발견된 이슈: ${allIssues.length}건)`);
-    return allIssues;
+    if (failures.length > 0) {
+        console.warn(`⚠️ [Page] ${failures.length}건 로드 실패 (첫 3건):`);
+        for (const f of failures.slice(0, 3)) console.warn(`     - ${f}`);
+    }
+
+    console.log(`✅ [Page] 완료 (이슈 ${issues.length}건)`);
+    return issues;
 }
