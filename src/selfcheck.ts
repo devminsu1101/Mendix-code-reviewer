@@ -21,6 +21,14 @@ const CLASSES: Record<string, unknown> = {
     "microflows.RetrieveAction": microflows.RetrieveAction,
     "microflows.DatabaseRetrieveSource": microflows.DatabaseRetrieveSource,
     "microflows.AssociationRetrieveSource": microflows.AssociationRetrieveSource,
+    // L001이 "first인가 / 무엇을 반복하는가"를 판정하는 데 쓴다.
+    // 사라지면 모든 루프 조회가 조용히 Error로 남는다 — 티가 안 나는 실패다.
+    "microflows.ConstantRange": microflows.ConstantRange,
+    "microflows.IterableList": microflows.IterableList,
+    "microflows.CreateVariableAction": microflows.CreateVariableAction,
+    // D003이 인덱스 현황을 읽는 데 쓴다.
+    "domainmodels.Index": domainmodels.Index,
+    "domainmodels.IndexedAttribute": domainmodels.IndexedAttribute,
     "microflows.CreateObjectAction": microflows.CreateObjectAction,
     "microflows.ChangeObjectAction": microflows.ChangeObjectAction,
     "microflows.CommitAction": microflows.CommitAction,
