@@ -32,15 +32,24 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
     const issues: ReviewIssue[] = [];
     const dependencyMap: Record<string, Record<string, number>> = {};
 
+    /** 위치 인자가 많아져 뜻을 잃었다. 선택 항목은 이름으로 받는다. */
+    interface AddOptions {
+        score?: number;
+        /** 룰 기본 권장문구가 이 상황에 안 맞을 때 덮어쓴다. */
+        recommendation?: string;
+        /** 규칙별 표의 열. @see ReviewIssue.facts */
+        facts?: Record<string, string>;
+        /** 같은 규칙 안에서의 정렬 키. @see ReviewIssue.focusRank */
+        focusRank?: number;
+    }
+
     const add = (
         ruleKey: keyof typeof MendixRules,
         location: string,
         message: string,
         severity: "Warning" | "Error",
         evidence: string[],
-        scoreOverride?: number,
-        /** 룰 기본 권장문구가 이 상황에 안 맞을 때 덮어쓴다. */
-        recommendationOverride?: string
+        opts: AddOptions = {}
     ) => {
         const rule = MendixRules[ruleKey];
         issues.push({
@@ -48,10 +57,12 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
             ruleId: rule.id,
             location,
             message,
-            recommendation: recommendationOverride ?? rule.recommendation,
+            recommendation: opts.recommendation ?? rule.recommendation,
             severity,
             evidence,
-            score: scoreOverride ?? rule.baseScore,
+            score: opts.score ?? rule.baseScore,
+            facts: opts.facts,
+            focusRank: opts.focusRank,
         });
     };
 
@@ -101,7 +112,14 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                     qName,
                     `연관관계가 ${relatedCount}개입니다.`,
                     "Warning",
-                    [usageLine]
+                    [usageLine],
+                    {
+                        facts: {
+                            연관관계: String(relatedCount),
+                            "사용 flow": String(touchCount),
+                        },
+                        focusRank: relatedCount * 10 + touchCount,
+                    }
                 );
             }
 
@@ -112,7 +130,11 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                     qName,
                     `Non-Persistable 명명 규칙인데 Persistable로 설정되어 있습니다.`,
                     "Error",
-                    [usageLine]
+                    [usageLine],
+                    {
+                        facts: { "사용 flow": String(touchCount) },
+                        focusRank: touchCount,
+                    }
                 );
             }
 
@@ -177,14 +199,26 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                         // 루프 안이거나 무인/외부 경로면 비용이 반복·빈도만큼 곱해진다.
                         inLoop > 0 || hotFlows.size > 0 ? "Error" : "Warning",
                         evidence,
-                        MendixRules.MISSING_INDEX.baseScore + inLoop * 5 + hotFlows.size * 3,
-                        orCombined
-                            ? "조회 조건이 `or`로 묶여 있습니다. 복합 인덱스는 `or`에 쓰이지 않으므로 " +
+                        {
+                            score:
+                                MendixRules.MISSING_INDEX.baseScore +
+                                inLoop * 5 +
+                                hotFlows.size * 3,
+                            recommendation: orCombined
+                                ? "조회 조건이 `or`로 묶여 있습니다. 복합 인덱스는 `or`에 쓰이지 않으므로 " +
                                   "**각 속성에 단일 컬럼 인덱스를 따로** 만드세요. " +
                                   "String 속성은 Max length가 Unlimited면 인덱스를 걸 수 없습니다."
-                            : "엔티티 Properties → Indexes 탭에서 위 속성에 인덱스를 추가하세요. " +
+                                : "엔티티 Properties → Indexes 탭에서 위 속성에 인덱스를 추가하세요. " +
                                   "여러 속성이 항상 함께 조건에 쓰이면 선택도 높은 것을 앞에 둔 복합 인덱스가 낫습니다(leftmost prefix). " +
-                                  "String 속성은 Max length가 Unlimited면 인덱스를 걸 수 없습니다."
+                                  "String 속성은 Max length가 Unlimited면 인덱스를 걸 수 없습니다.",
+                            facts: {
+                                "미커버 속성": String(uncovered.length),
+                                "루프 내": inLoop > 0 ? String(inLoop) : "-",
+                                "무인/외부": hotFlows.size > 0 ? String(hotFlows.size) : "-",
+                                "기존 인덱스": String(indexInfo?.count ?? 0),
+                            },
+                            focusRank: inLoop * 100 + hotFlows.size * 10 + uncovered.length,
+                        }
                     );
                 }
             }
@@ -197,7 +231,11 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                         qName,
                         `Persistable 엔티티에 접근 규칙이 하나도 없습니다.`,
                         "Error",
-                        [securityNote, usageLine]
+                        [securityNote, usageLine],
+                        {
+                            facts: { "사용 flow": String(touchCount) },
+                            focusRank: touchCount,
+                        }
                     );
                 } else {
                     const openReads = entity.accessRules.filter(
@@ -218,7 +256,15 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                                 securityNote,
                                 roles.length > 0 ? `대상 역할: ${roles.join(", ")}` : "역할 미지정",
                                 usageLine,
-                            ]
+                            ],
+                            {
+                                facts: {
+                                    "열린 규칙": String(openReads.length),
+                                    "사용 flow": String(touchCount),
+                                    역할: roles.length > 0 ? roles.join(", ") : "미지정",
+                                },
+                                focusRank: touchCount * 10 + openReads.length,
+                            }
                         );
                     }
                 }
@@ -235,7 +281,15 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                         usageLine,
                         `주요 사용처: ${[...(usage?.readBy ?? [])].slice(0, 5).join(", ")}`,
                     ],
-                    MendixRules.HOT_ENTITY.baseScore + Math.floor(touchCount / 5)
+                    {
+                        score: MendixRules.HOT_ENTITY.baseScore + Math.floor(touchCount / 5),
+                        facts: {
+                            "사용 flow": String(touchCount),
+                            조회: String(usage?.readBy.size ?? 0),
+                            변경: String(usage?.writtenBy.size ?? 0),
+                        },
+                        focusRank: touchCount,
+                    }
                 );
             }
         }
@@ -251,7 +305,11 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                 `모듈 간 엔티티 참조가 ${count}건입니다.`,
                 "Warning",
                 [`'${sourceMod}'이(가) '${targetMod}'의 데이터 구조에 직접 의존합니다.`],
-                MendixRules.STRONG_COUPLING.baseScore + count
+                {
+                    score: MendixRules.STRONG_COUPLING.baseScore + count,
+                    facts: { 참조: String(count) },
+                    focusRank: count,
+                }
             );
         }
     }

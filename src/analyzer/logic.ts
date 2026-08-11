@@ -29,10 +29,23 @@ interface LoopRetrieve {
     loopSourceOrigin: VarOrigin;
 }
 
+/**
+ * 루프 안에서 발견된 커밋 하나.
+ *
+ * L001과 마찬가지로 **감싼 루프가 무엇을 도는지**를 같이 들고 다닌다.
+ * 트랜잭션 횟수 = 반복 횟수이므로, 반복에 상한이 있는지가 비용을 가르는 축이다.
+ */
+interface LoopCommit {
+    label: string;
+    sourceVar: string | null;
+    origin: VarOrigin;
+    loopDepth: number;
+}
+
 /** 루프 안에서 관측된 사실들 */
 interface LoopFindings {
     loopRetrieves: LoopRetrieve[];
-    commitSites: string[];
+    commitSites: LoopCommit[];
     noRollbackSites: string[];
     /**
      * 변수 출처를 하나라도 해석했는가.
@@ -170,23 +183,31 @@ function scanFlowBody(node: FlowNode): LoopFindings {
 
         // 커밋 지점은 캡션 대신 **대상 변수·엔티티**로 적는다.
         // 자동 생성 캡션은 "Activity"로 나와서 리포트에 아무 정보도 주지 못한다.
+        const addCommit = (label: string) => {
+            const src = describeLoopSource(loopStack[loopStack.length - 1], origins);
+            found.commitSites.push({
+                label,
+                sourceVar: src.variable,
+                origin: src.origin,
+                loopDepth,
+            });
+        };
+
         if (action instanceof microflows.CommitAction) {
-            found.commitSites.push(`Commit(${action.commitVariableName || "?"})`);
+            addCommit(`Commit(${action.commitVariableName || "?"})`);
             return;
         }
 
         if (action instanceof microflows.ChangeObjectAction) {
             if (action.commit !== microflows.CommitEnum.No) {
-                found.commitSites.push(`Change(${action.changeVariableName || "?"}, Commit=Yes)`);
+                addCommit(`Change(${action.changeVariableName || "?"}, Commit=Yes)`);
             }
             return;
         }
 
         if (action instanceof microflows.CreateObjectAction) {
             if (action.commit !== microflows.CommitEnum.No) {
-                found.commitSites.push(
-                    `Create(${action.entityQualifiedName ?? "?"}, Commit=Yes)`
-                );
+                addCommit(`Create(${action.entityQualifiedName ?? "?"}, Commit=Yes)`);
             }
         }
     });
@@ -233,6 +254,34 @@ export interface RuleHit {
     recommendation?: string;
     /** 이 flow가 조회 조건으로 쓴 속성. 엔티티 qName -> 속성명. 인덱스 교차 참조용. */
     queryKeys?: Map<string, string[]>;
+    /** 규칙별 표의 열. @see ReviewIssue.facts */
+    facts?: Record<string, string>;
+    /** 같은 규칙 안에서의 정렬 키. @see ReviewIssue.focusRank */
+    focusRank?: number;
+}
+
+/**
+ * 반복 횟수에 상한이 있는가를 한 낱말로.
+ *
+ * L001·L002가 같은 판정을 공유한다. 루프 안의 비용(쿼리든 트랜잭션이든)은
+ * 전부 **반복 횟수만큼 곱해지므로**, 반복이 무엇에 묶여 있는지가 공통 축이다.
+ * 모르면 상한이 없다고 단정하지 않고 "확인 불가"로 둔다(fail closed).
+ */
+export function boundLabel(origin: VarOrigin, loopDepth: number, resolved: boolean): string {
+    if (!resolved) return "확인 불가";
+    if (loopDepth > 1) return "없음(중첩)";
+    if (origin === "memory" || origin === "param") return "입력 크기";
+    if (origin === "db") return "없음(DB 리스트)";
+    return "확인 불가";
+}
+
+/** 여러 루프에서 나온 판정을 하나로 접는다. 하나라도 상한이 없으면 그게 이 flow의 성격이다. */
+export function worstBound(labels: string[]): string {
+    if (labels.some((l) => l.startsWith("없음"))) {
+        return labels.find((l) => l.startsWith("없음"))!;
+    }
+    if (labels.includes("확인 불가")) return "확인 불가";
+    return labels[0] ?? "확인 불가";
 }
 
 const ORIGIN_LABEL: Record<VarOrigin, string> = {
@@ -312,6 +361,14 @@ function buildLoopRetrieveHit(body: LoopFindings, hotPath: boolean): RuleHit {
         ]);
     }
 
+    const boundText = bounded
+        ? "입력 크기"
+        : worstBound(
+              retrieves.map((r) =>
+                  boundLabel(r.loopSourceOrigin, r.loopDepth, body.originsResolved)
+              )
+          );
+
     return {
         ruleKey: "LOOP_DB_RETRIEVE",
         // "N회 발생"이 아니라 "액션 N개"다. 이 숫자는 정적 개수이지 실행 횟수가 아닌데,
@@ -321,6 +378,12 @@ function buildLoopRetrieveHit(body: LoopFindings, hotPath: boolean): RuleHit {
             `대상: ${entities.join(", ")}.`,
         severity: bounded ? "Warning" : "Error",
         evidence,
+        facts: {
+            "조회 액션": String(retrieves.length),
+            "반복 상한": boundText,
+            대상: entities.slice(0, 2).join(", ") + (entities.length > 2 ? " 외" : ""),
+        },
+        focusRank: (bounded ? 0 : 100) + retrieves.length,
         scoreMultiplier: bounded ? 0.5 : 1,
         recommendation: bounded
             ? "반복 횟수가 입력 크기로 묶여 있어 구조 변경보다 조회 키 인덱스가 우선입니다. " +
@@ -359,25 +422,54 @@ export function detectFlowIssues(node: FlowNode, hotPath = false): RuleHit[] {
 
     // L002 — 루프 내 커밋
     if (body.commitSites.length > 0) {
-        add(
-            "LOOP_COMMIT",
-            `루프 내에서 DB 커밋이 ${body.commitSites.length}회 발생합니다.`,
-            "Error",
-            [`커밋 지점: ${[...new Set(body.commitSites)].slice(0, 5).join(", ")}`]
+        const sites = body.commitSites;
+        const bound = worstBound(
+            sites.map((c) => boundLabel(c.origin, c.loopDepth, body.originsResolved))
         );
+        const unbounded = bound.startsWith("없음");
+        const sample = sites.find(
+            (c) => boundLabel(c.origin, c.loopDepth, body.originsResolved) === bound
+        );
+
+        const evidence = [
+            `커밋 지점: ${[...new Set(sites.map((c) => c.label))].slice(0, 5).join(", ")}`,
+            unbounded
+                ? `반복 대상: ${sample?.sourceVar ? `$${sample.sourceVar} — ` : ""}${ORIGIN_LABEL[sample?.origin ?? "unknown"]}. ` +
+                  `트랜잭션 수가 데이터량을 따라 늘어납니다.`
+                : `반복 대상: $${sample?.sourceVar} — ${ORIGIN_LABEL[sample?.origin ?? "unknown"]}이므로 ` +
+                  `트랜잭션 수가 입력 크기로 묶입니다.`,
+        ];
+        if (!body.originsResolved) {
+            evidence.push(
+                "⚠️ 변수 출처를 하나도 해석하지 못했습니다(SDK 프로퍼티 확인 필요). 상한을 단정하지 않습니다."
+            );
+        }
+
+        add("LOOP_COMMIT", `루프 내에서 DB 커밋이 ${sites.length}회 발생합니다.`, "Error", evidence, {
+            facts: { "커밋 지점": String(sites.length), "반복 상한": bound },
+            focusRank: (unbounded ? 100 : 0) + sites.length,
+        });
     }
 
     // L005 — 중첩 루프
     if (node.maxLoopDepth >= 2) {
+        const withRetrieve = body.loopRetrieves.length > 0;
         add(
             "NESTED_LOOP",
             `루프가 ${node.maxLoopDepth}단계로 중첩되어 있습니다.`,
             "Error",
             [
-                body.loopRetrieves.length > 0
+                withRetrieve
                     ? "중첩 루프 안에 DB 조회까지 있어 실행 시간이 곱으로 증가합니다."
                     : "데이터량 증가 시 실행 시간이 제곱으로 늘어납니다.",
-            ]
+            ],
+            {
+                facts: {
+                    "중첩 깊이": `${node.maxLoopDepth}단`,
+                    "루프 내 조회": withRetrieve ? `${body.loopRetrieves.length}개` : "없음",
+                },
+                focusRank: node.maxLoopDepth * 10 + (withRetrieve ? 5 : 0),
+            }
         );
     }
 
@@ -388,15 +480,34 @@ export function detectFlowIssues(node: FlowNode, hotPath = false): RuleHit[] {
             `액션이 ${node.actionCount}개입니다.`,
             hotPath ? "Error" : "Warning",
             [
-                `호출하는 하위 flow ${node.calls.size}개 / Java 액션 ${node.javaCalls.size}개`,
-                `읽는 엔티티 ${node.reads.size}개`,
-            ]
+                // 이 세 줄은 "얼마나 위험한가"가 아니라 "쪼갤 실마리가 있는가"를 말한다.
+                // 하위 flow가 0개면 이미 쪼개진 게 아니라 **한 번도 안 쪼갠** 것이다.
+                `호출하는 하위 flow ${node.calls.size}개 / Java 액션 ${node.javaCalls.size}개` +
+                    (node.calls.size === 0
+                        ? " — 하위 flow가 없어 액션 전부를 이 문서 하나가 들고 있습니다"
+                        : ""),
+                `다루는 엔티티: 조회 ${node.reads.size}개 / 변경 ${node.writes.size}개` +
+                    (node.reads.size + node.writes.size >= 3
+                        ? " — 책임이 여러 엔티티에 걸쳐 있습니다"
+                        : ""),
+            ],
+            {
+                facts: {
+                    "액션 수": String(node.actionCount),
+                    "하위 flow": String(node.calls.size),
+                    엔티티: String(node.reads.size + node.writes.size),
+                },
+                focusRank: node.actionCount,
+            }
         );
     }
 
     // L004 — 파라미터 과다
     if (node.paramCount > 7) {
-        add("TOO_MANY_PARAMS", `파라미터가 ${node.paramCount}개입니다.`, "Warning", []);
+        add("TOO_MANY_PARAMS", `파라미터가 ${node.paramCount}개입니다.`, "Warning", [], {
+            facts: { 파라미터: String(node.paramCount) },
+            focusRank: node.paramCount,
+        });
     }
 
     // L007 — 롤백 없는 커스텀 에러 처리
@@ -405,7 +516,14 @@ export function detectFlowIssues(node: FlowNode, hotPath = false): RuleHit[] {
             "NO_ROLLBACK",
             `커밋이 있는데 롤백 없는 Custom 에러 처리가 ${body.noRollbackSites.length}곳 있습니다.`,
             "Error",
-            [`대상: ${[...new Set(body.noRollbackSites)].slice(0, 5).join(", ")}`]
+            [`대상: ${[...new Set(body.noRollbackSites)].slice(0, 5).join(", ")}`],
+            {
+                facts: {
+                    "롤백 없는 지점": String(body.noRollbackSites.length),
+                    "커밋 엔티티": String(node.commits.size),
+                },
+                focusRank: body.noRollbackSites.length,
+            }
         );
     }
 
@@ -469,6 +587,8 @@ function analyzeFlow(node: FlowNode, graph: ModelGraph): ReviewIssue[] {
             severity: hit.severity,
             evidence: [reachLine, ...hit.evidence, ...describeIndexCoverage(hit, graph)],
             score: scoreWithReach(rule.baseScore * (hit.scoreMultiplier ?? 1), reach),
+            facts: hit.facts,
+            focusRank: hit.focusRank,
         };
     };
 
@@ -482,6 +602,11 @@ function analyzeFlow(node: FlowNode, graph: ModelGraph): ReviewIssue[] {
                 message: `어떤 진입점에서도 도달할 수 없습니다.`,
                 severity: "Warning",
                 evidence: [`액션 ${node.actionCount}개 / 호출하는 하위 flow ${node.calls.size}개`],
+                facts: {
+                    "액션 수": String(node.actionCount),
+                    종류: node.kind,
+                },
+                focusRank: node.actionCount,
             })
         );
     }
@@ -527,6 +652,8 @@ export async function analyzeLogic(graph: ModelGraph): Promise<ReviewIssue[]> {
             severity: "Warning",
             evidence: [`동일 그룹: ${group.join(", ")}`],
             score: rule.baseScore + group.length,
+            facts: { "복제된 flow": `${group.length}개` },
+            focusRank: group.length,
         });
     }
 
