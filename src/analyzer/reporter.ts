@@ -119,6 +119,57 @@ function renderIssueDetail(
  *    사실상 "규칙 기본점수순"으로 붕괴한다(L002 9건 중 6건이 59점 동점).
  *    규칙 안에서만 정렬하면 그 붕괴가 순위를 왜곡하지 않는다.
  */
+/** 카탈로그 전체를 ID 순으로. 0건 규칙도 리포트에 나와야 하므로 이슈가 아니라 카탈로그가 기준이다. */
+export function catalogRuleIds(): string[] {
+    return Object.values(MendixRules)
+        .map((r) => r.id)
+        .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * 규칙 17종 전체의 점검 결과를 한 표로.
+ *
+ * 규칙별 섹션은 ID 순이라 "무엇이 제일 심각한가"가 드러나지 않는다. 그 정보를 여기서 준다.
+ * 0건도 반드시 한 줄을 차지한다 — 섹션이 없으면 *위반이 없어서*인지 *룰이 죽어 탐지를
+ * 못 한 것*인지 구분할 수 없고, 그건 selfcheck를 만든 이유였던 바로 그 조용한 실패다.
+ */
+export function renderRuleScoreboard(
+    ruleIds: string[],
+    byRule: Map<string, ReviewIssue[]>
+): string {
+    let out = `| 규칙 | 이름 | 건수 | 🔴 | 최고 점수 | 상태 |\n`;
+    out += `| :--- | :--- | ---: | ---: | ---: | :--- |\n`;
+    for (const ruleId of ruleIds) {
+        const group = byRule.get(ruleId) ?? [];
+        const rule = RULE_BY_ID.get(ruleId);
+        const errors = group.filter((i) => i.severity === "Error").length;
+        const top = group.length > 0 ? Math.max(...group.map((i) => i.score)) : 0;
+        // D005·D006처럼 목표가 "검토 필요"인 규칙은 0건이어도 Pass라고 말하지 않는다.
+        const judgeable = rule?.target !== "검토 필요";
+        const status =
+            group.length === 0
+                ? judgeable
+                    ? "✅ 위반 없음"
+                    : "✅ 해당 없음"
+                : !judgeable
+                  ? "ℹ️ 검토 필요"
+                  : errors > 0
+                    ? "🔴 조치 필요"
+                    : "⚠️ 확인 필요";
+        out += `| [${ruleId}] | ${rule?.name ?? "(카탈로그에 없음)"} | ${group.length} | ${errors || "-"} | ${top || "-"} | ${status} |\n`;
+    }
+    return out;
+}
+
+/** 0건 규칙. 짧게, 그러나 반드시 출력한다. */
+export function renderCleanRule(ruleId: string): string {
+    const rule = RULE_BY_ID.get(ruleId);
+    let out = `### ✅ [${ruleId}] ${rule?.name ?? "(알 수 없는 규칙)"} — 0건\n\n`;
+    out += `${rule?.description ?? "-"}\n\n`;
+    out += `▸ 이 규칙에 걸린 곳이 없습니다. (목표: ${rule?.target ?? "-"})\n`;
+    return out;
+}
+
 export function renderRuleSection(
     ruleId: string,
     issues: ReviewIssue[],
@@ -129,7 +180,7 @@ export function renderRuleSection(
     const errors = issues.filter((i) => i.severity === "Error").length;
     const badge = errors > 0 ? "🔴" : "⚠️";
 
-    let out = `### ${badge} ${ruleId} · ${rule?.name ?? "(알 수 없는 규칙)"} — ${issues.length}건`;
+    let out = `### ${badge} [${ruleId}] ${rule?.name ?? "(알 수 없는 규칙)"} — ${issues.length}건`;
     if (errors > 0 && errors < issues.length) out += ` (🔴 ${errors} / ⚠️ ${issues.length - errors})`;
     out += `\n\n`;
     out += `${rule?.description ?? "-"}\n\n`;
@@ -216,7 +267,7 @@ export function renderComposite(issues: ReviewIssue[], graph: ModelGraph): strin
         `개별 점수는 낮아도 손대는 순서로는 여기가 먼저입니다.\n\n`;
     out += `| 위치 | 걸린 규칙 | 합산 점수 | 진입 |\n| :--- | :--- | ---: | :--- |\n`;
     for (const r of rows) {
-        out += `| ${r.hasError ? "🔴" : "⚠️"} \`${r.location}\` | ${r.rules.join(" + ")} | ${r.total} | ${entryLabel(r.location, graph)} |\n`;
+        out += `| ${r.hasError ? "🔴" : "⚠️"} \`${r.location}\` | ${r.rules.map((id) => `[${id}]`).join(" + ")} | ${r.total} | ${entryLabel(r.location, graph)} |\n`;
     }
     return out;
 }
@@ -357,7 +408,12 @@ function renderEntryPointProfile(graph: ModelGraph): string {
 
     let out = `- **리뷰 대상 flow ${reviewable.length}개** (전체 ${graph.flows.size}개) — 도달 가능 ${reachable}개 / 고아 ${orphans}개\n`;
     if (graph.excludedModules.size > 0) {
-        out += `- **제외된 모듈 ${graph.excludedModules.size}개** (마켓플레이스·테마, 수정 대상 아님): ${[...graph.excludedModules].sort().join(", ")}\n`;
+        // 사유를 모듈마다 붙인다. 이름만 나열하면 우리 모듈이 테마로 오분류돼 빠져도
+        // 읽는 사람이 알아챌 방법이 없다 (DesignAsset이 실제로 그랬다).
+        const excluded = [...graph.excludedModules.entries()]
+            .sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([name, reason]) => `${name}(${reason})`);
+        out += `- **제외된 모듈 ${graph.excludedModules.size}개** (수정 대상 아니라고 판정 — 그래프에는 남기고 지적만 하지 않음): ${excluded.join(", ")}\n`;
     }
     out += `- **진입점 ${graph.entryPoints.length}개** — `;
     out += [...byKind.entries()].map(([k, v]) => `${k} ${v}`).join(", ") || "없음";
@@ -421,11 +477,11 @@ export async function generateReport(
     content += `## 🎯 KPI\n`;
     content += `| 지표 | 목표 | 상태 | 결과 |\n| :--- | :--- | :--- | :--- |\n`;
     content += `| 치명적 오류 | 0건 | ${errors.length === 0 ? "✅ Pass" : "❌ Fail"} | ${errors.length}건 |\n`;
-    content += `| 루프 내 DB 작업 (L001/L002) | 0건 | ${loopDbCount === 0 ? "✅ Pass" : "❌ Fail"} | ${loopDbCount}건 |\n`;
-    content += `| 중첩 루프 (L005) | 0건 | ${nestedLoopCount === 0 ? "✅ Pass" : "❌ Fail"} | ${nestedLoopCount}건 |\n`;
-    content += `| 로직 복잡도 (L003) | 25 액션 미만 | ${complexityCount === 0 ? "✅ Pass" : "⚠️ Warning"} | ${complexityCount}건 |\n`;
-    content += `| 접근 규칙 누락 (D004/P002) | 0건 | ${missingRuleCount === 0 ? "✅ Pass" : "❌ Fail"} | ${missingRuleCount}건 |\n`;
-    content += `| 무제약 접근 (D005) | 검토 필요 | ${unconstrainedCount === 0 ? "✅ 해당 없음" : "ℹ️ 검토"} | ${unconstrainedCount}건 |\n\n`;
+    content += `| 루프 내 DB 작업 [L001]/[L002] | 0건 | ${loopDbCount === 0 ? "✅ Pass" : "❌ Fail"} | ${loopDbCount}건 |\n`;
+    content += `| 중첩 루프 [L005] | 0건 | ${nestedLoopCount === 0 ? "✅ Pass" : "❌ Fail"} | ${nestedLoopCount}건 |\n`;
+    content += `| 로직 복잡도 [L003] | 25 액션 미만 | ${complexityCount === 0 ? "✅ Pass" : "⚠️ Warning"} | ${complexityCount}건 |\n`;
+    content += `| 접근 규칙 누락 [D004]/[P002] | 0건 | ${missingRuleCount === 0 ? "✅ Pass" : "❌ Fail"} | ${missingRuleCount}건 |\n`;
+    content += `| 무제약 접근 [D005] | 검토 필요 | ${unconstrainedCount === 0 ? "✅ 해당 없음" : "ℹ️ 검토"} | ${unconstrainedCount}건 |\n\n`;
 
     content += `## ⚠️ 여러 규칙에 동시에 걸린 곳\n\n`;
     content += renderComposite(issues, graph);
@@ -452,15 +508,25 @@ export async function generateReport(
         return maxB - maxA || b[1].length - a[1].length || a[0].localeCompare(b[0]);
     });
 
+    // 섹션은 **카탈로그 ID 순**으로 전량 훑는다. 이슈가 있는 규칙만 출력하면
+    // 빠진 규칙이 "통과"인지 "탐지 실패"인지 리포트만 보고는 알 수 없다.
+    // 대신 "무엇이 제일 심각한가"는 바로 아래 점검 현황 표가 담당한다.
+    const catalogIds = catalogRuleIds();
+    const unknownIds = [...byRule.keys()].filter((id) => !RULE_BY_ID.has(id)).sort();
+    const allRuleIds = [...catalogIds, ...unknownIds];
+
     content += `## 📋 규칙별 상세 (전체 ${issues.length}건)\n\n`;
-    if (ruleOrder.length === 0) {
-        content += `발견된 이슈가 없습니다.\n\n`;
-    } else {
-        content += `규칙 순서는 *그 규칙에서 나온 최고 점수*입니다. 각 규칙 안의 순서는 섹션마다 밝혀 둡니다.\n\n`;
-        for (const [ruleId, group] of ruleOrder) {
-            content += renderRuleSection(ruleId, group, graph, blame);
-            content += `\n`;
-        }
+    content += `규칙 ${catalogIds.length}종 **전체**를 점검한 결과입니다. 0건인 규칙도 그대로 싣습니다 — 섹션이 없으면 위반이 없어서인지 탐지가 안 된 것인지 구분할 수 없기 때문입니다.\n\n`;
+    content += renderRuleScoreboard(allRuleIds, byRule);
+    content += `\n`;
+    content += `아래 섹션은 규칙 ID 순입니다. 각 규칙 안의 순서는 섹션마다 밝혀 둡니다.\n\n`;
+    for (const ruleId of allRuleIds) {
+        const group = byRule.get(ruleId) ?? [];
+        content +=
+            group.length === 0
+                ? renderCleanRule(ruleId)
+                : renderRuleSection(ruleId, group, graph, blame);
+        content += `\n`;
     }
 
     content += `## 🔑 인덱스가 필요한 속성\n\n`;
@@ -483,7 +549,7 @@ export async function generateReport(
             const errs = group.filter((i) => i.severity === "Error").length;
             const name = RULE_BY_ID.get(ruleId)?.name ?? "";
             console.log(
-                `   ${ruleId.padEnd(5)} ${name.padEnd(22)} ${String(group.length).padStart(3)}건` +
+                `   ${`[${ruleId}]`.padEnd(7)} ${name.padEnd(22)} ${String(group.length).padStart(3)}건` +
                     (errs > 0 ? ` (🔴 ${errs})` : "") +
                     `  ← ${group[0].location}`
             );

@@ -161,12 +161,14 @@ export const MendixRules: Record<string, BestPractice> = {
         id: "D005",
         name: "XPath 제약 없는 접근",
         description:
-            "읽기 권한이 XPath 제약 없이 열려 있습니다. 해당 역할은 이 엔티티의 모든 행을 볼 수 있습니다.",
+            "접근 규칙에 XPath 제약이 없습니다. 해당 역할은 이 엔티티의 **모든 행**을 봅니다. " +
+            "다만 전부 같은 무게는 아닙니다 — 익명 역할에 열린 것은 대개 사고이고, " +
+            "관리자 역할에만 열린 것은 대개 의도입니다. 그래서 열린 대상의 등급으로 순서를 매깁니다.",
         recommendation:
             "테넌트·소유자·조직 단위로 걸러야 하는 데이터라면 Access Rule에 XPath constraint를 추가하세요.",
         target: "검토 필요",
         baseScore: 18,
-        focusAxis: "이 엔티티를 다루는 flow 수 (노출 반경) → 열린 규칙 수",
+        focusAxis: "열린 대상 등급(익명 → 일반 → 관리자 전용) → 쓰기 허용 여부 → 노출 반경(사용 flow 수)",
     },
     HOT_ENTITY: {
         id: "D006",

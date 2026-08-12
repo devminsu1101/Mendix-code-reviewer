@@ -118,7 +118,8 @@ export interface ModelGraph {
     /** 엔티티 qName -> 속성명 -> 조회 조건 사용 현황 */
     entityQueryKeys: Map<string, Map<string, QueryKeyUsage>>;
     /** 마켓플레이스·테마 모듈 이름. 지적 대상에서 제외되지만 그래프에는 남는다. */
-    excludedModules: Set<string>;
+    /** 지적 대상에서 제외된 모듈 → 제외 사유. 그래프에는 남기되 지적만 하지 않는다. */
+    excludedModules: Map<string, string>;
     /** 지적 대상 모듈 이름 */
     reviewableModules: Set<string>;
 }
@@ -245,7 +246,8 @@ function recordAction(
 export function buildNode(
     doc: microflows.MicroflowBase,
     kind: FlowKind,
-    excludedModules: Set<string>
+    /** 멤버십만 보므로 Set/Map 어느 쪽이든 받는다 (blame은 빈 Set을 넘긴다). */
+    excludedModules: { has(moduleName: string): boolean }
 ): FlowNode {
     const qName = doc.qualifiedName ?? "(unnamed)";
     const node: FlowNode = {
@@ -541,8 +543,12 @@ function computeEntityQueryKeys(
 
     for (const node of flows.values()) {
         if (!node.reviewable) continue;
-        const hottest = reach.get(node.qName)?.hottest?.kind;
-        const isHot = hottest === "ScheduledEvent" || hottest === "PublishedService";
+        // 진입 **유형**이 아니라 **가중치**로 판정한다.
+        // 비활성 스케줄은 kind가 "ScheduledEvent"인 채로 weight만 1로 낮춰 두었기 때문에,
+        // kind로 보면 꺼져 있는 스케줄이 무인 경로로 계산되어
+        // 같은 리포트의 "(비활성)" 표기와 모순된다.
+        const hottest = reach.get(node.qName)?.hottest;
+        const isHot = (hottest?.weight ?? 0) >= ENTRY_WEIGHT.PublishedService;
 
         for (const [entity, attrs] of node.queryKeys) {
             const loopAttrs = node.loopQueryKeys.get(entity);
@@ -564,14 +570,19 @@ export async function buildGraph(model: IModel): Promise<ModelGraph> {
     console.log("🧭 [Graph] 모델 관계 인덱스 구축 시작...");
 
     // 마켓플레이스·테마 모듈 식별. 우리가 고칠 수 있는 코드가 아니므로 지적하지 않는다.
-    const excludedModules = new Set<string>();
+    // 사유를 함께 들고 간다. 목록만 출력하면 "우리 모듈인데 왜 빠졌지"를 판단할 수 없고,
+    // 실제로 DesignAsset이 테마 모듈로 걸려 빠진 것을 한참 뒤에야 발견했다.
+    const excludedModules = new Map<string, string>();
     const reviewableModules = new Set<string>();
     for (const mod of model.allModules()) {
         try {
             // IModule은 load() 없이 속성을 직접 노출한다.
             // isThemeModule은 메타모델 9.3.0에서 도입되어 구버전에선 undefined일 수 있다.
             if (SYSTEM_MODULES.has(mod.name)) continue;
-            if (mod.fromAppStore || mod.isThemeModule) excludedModules.add(mod.name);
+            const reasons: string[] = [];
+            if (mod.fromAppStore) reasons.push("마켓플레이스");
+            if (mod.isThemeModule) reasons.push("테마 모듈");
+            if (reasons.length > 0) excludedModules.set(mod.name, reasons.join("+"));
             else reviewableModules.add(mod.name);
         } catch {
             /* 판정 실패 시 리뷰 대상으로 둔다 — 조용히 빠뜨리는 것보다 낫다 */

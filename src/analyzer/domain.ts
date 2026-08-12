@@ -6,17 +6,148 @@ import { isPersistableEntity, ModelGraph } from "./graph.js";
 
 const SYSTEM_MODULES = new Set(["System", "Administration"]);
 
-/** 보안 검사는 프로젝트 보안 수준에 따라 의미가 달라진다. 먼저 읽어 둔다. */
-async function readSecurityLevel(model: IModel): Promise<security.SecurityLevel | null> {
+// ── 접근 규칙 판정 (D005) ─────────────────────────────────────────────
+//
+// D005의 핵심은 건수가 아니라 **순서**다. 실측 161건 리포트에서 54건이 전부 18점으로
+// 평평했는데, 그 안에는 `LoginAsset.Account`가 익명 역할에 전체 열람을 준 건과
+// `LoginAsset.OrganizationUnit`이 관리자 역할에만 열린 건이 같은 점수로 섞여 있었다.
+// 앞은 사고고 뒤는 대개 의도다. 둘을 가르지 못하면 54건을 다 읽어야 사고를 찾는다.
+
+/** 이 접근 규칙이 누구에게 열려 있는가. */
+export type AccessTier = "guest" | "general" | "adminOnly" | "unknown";
+
+/**
+ * 역할 등급 판정의 근거.
+ *
+ * 역할 **이름**으로 추측하지 않는다. "Administrator"라는 모듈 역할이 실제로 관리자
+ * 사용자 역할에 묶여 있는지는 ProjectSecurity가 답을 갖고 있고, 이름 규칙은 앱마다 다르다.
+ * 이름 매칭으로 짜면 다른 앱에 붙이는 순간 조용히 틀린다.
+ */
+export interface RoleTiers {
+    /** 관리자 사용자 역할에 묶인 모듈 역할 qName */
+    admin: Set<string>;
+    /** 익명(게스트) 사용자 역할에 묶인 모듈 역할 qName. 게스트 접근이 꺼져 있으면 비어 있다. */
+    guest: Set<string>;
+    /** 등급 판정의 근거를 실제로 읽었는가. 못 읽었으면 등급을 낮추지 않는다. */
+    resolved: boolean;
+}
+
+/**
+ * 이 규칙이 열려 있는 대상의 등급. 가장 위험한 쪽으로 판정한다.
+ *
+ * **fail closed** — 근거를 못 읽었거나 역할이 비어 있으면 `unknown`이고,
+ * `unknown`은 점수를 깎지 않는다. 모르면 봐주지 않는 것이 이 도구의 일관된 원칙이다.
+ */
+export function classifyAccessTier(roleQNames: string[], tiers: RoleTiers): AccessTier {
+    if (!tiers.resolved || roleQNames.length === 0) return "unknown";
+    if (roleQNames.some((r) => tiers.guest.has(r))) return "guest";
+    if (roleQNames.every((r) => tiers.admin.has(r))) return "adminOnly";
+    return "general";
+}
+
+export type AccessRights = "None" | "ReadOnly" | "ReadWrite";
+
+/**
+ * 이 규칙이 실제로 무엇을 허용하는가.
+ *
+ * 기존 구현은 `defaultMemberAccessRights !== None`만 봤는데, 그러면 **기본값은 None이면서
+ * 개별 속성(memberAccesses)에만 권한을 준 규칙**을 통째로 놓친다. 그런 규칙도 XPath 제약이
+ * 없으면 똑같이 전체 행이 열린 것이다.
+ */
+export function accessGrant(input: {
+    defaultRights: AccessRights;
+    memberRights: AccessRights[];
+    allowDelete: boolean;
+}): { grants: boolean; writes: boolean; label: string } {
+    const all = [input.defaultRights, ...input.memberRights];
+    const grants = all.some((r) => r !== "None");
+    const canWrite = all.some((r) => r === "ReadWrite");
+    const parts: string[] = [];
+    if (grants) parts.push("읽기");
+    if (canWrite) parts.push("쓰기");
+    // 삭제는 기존 행 전체가 대상이라 무제약일 때 읽기보다 무겁다.
+    if (input.allowDelete) parts.push("삭제");
+    return {
+        grants: grants || input.allowDelete,
+        writes: canWrite || input.allowDelete,
+        label: parts.join("+") || "없음",
+    };
+}
+
+/**
+ * 등급이 severity를 정한다. 쓰기 허용 여부는 **점수와 순서만** 움직인다.
+ *
+ * 처음엔 "일반 사용자 + 쓰기"도 Error로 잡았는데, 실측(RamsesKR minsu-clean)에서
+ * **59건 전부가 `읽기+쓰기+삭제`**여서 전건이 🔴가 됐다. 이 앱은 접근 규칙에 삭제 권한을
+ * 폭넓게 주고 있어서, 쓰기 여부가 이 코드베이스에서는 아무것도 가르지 못한다.
+ * 전건이 같은 등급이면 등급이 아니다 — 읽는 사람이 59건을 다시 다 읽어야 한다.
+ *
+ * 익명 노출만 Error로 남긴다. 그건 7건이고, 실제로 조치가 필요한 것이다.
+ */
+export function accessSeverity(tier: AccessTier): "Warning" | "Error" {
+    return tier === "guest" ? "Error" : "Warning";
+}
+
+/** 등급별 위험 배수의 기준값. general을 1.0으로 두고 상대화한다. */
+const TIER_WEIGHT: Record<AccessTier, number> = {
+    guest: 3, // 비로그인 사용자가 전체 행을 본다. 사고일 가능성이 높다.
+    general: 2, // 로그인한 일반 사용자가 전체 행을 본다.
+    unknown: 2, // 판정 근거를 못 읽었다 — general과 같게 두고 낮추지 않는다.
+    adminOnly: 1, // 관리자 역할에만 열렸다. 의도된 설정일 가능성이 높다.
+};
+
+const TIER_LABEL: Record<AccessTier, string> = {
+    guest: "익명",
+    general: "일반 사용자",
+    adminOnly: "관리자 전용",
+    unknown: "판정 불가",
+};
+
+/** SDK enum을 값 비교 가능한 문자열로. `.name`에 의존하지 않는다. */
+function rightsOf(r: domainmodels.MemberAccessRights | null | undefined): AccessRights {
+    if (r === domainmodels.MemberAccessRights.ReadWrite) return "ReadWrite";
+    if (r === domainmodels.MemberAccessRights.ReadOnly) return "ReadOnly";
+    return "None";
+}
+
+interface SecurityContext {
+    level: security.SecurityLevel | null;
+    tiers: RoleTiers;
+}
+
+/** 보안 검사는 프로젝트 보안 수준에 따라 의미가 달라진다. 역할 등급과 함께 먼저 읽어 둔다. */
+async function readSecurityContext(model: IModel): Promise<SecurityContext> {
+    const ctx: SecurityContext = {
+        level: null,
+        tiers: { admin: new Set(), guest: new Set(), resolved: false },
+    };
     for (const proxy of model.allProjectSecurities()) {
         try {
             const sec = await proxy.load();
-            return sec.securityLevel;
+            ctx.level = sec.securityLevel;
+
+            const byName = new Map(sec.userRoles.map((r) => [r.name, r]));
+            const admin = byName.get(sec.adminUserRoleName);
+            for (const q of admin?.moduleRolesQualifiedNames ?? []) ctx.tiers.admin.add(q);
+
+            const guest = sec.enableGuestAccess ? byName.get(sec.guestUserRoleName) : undefined;
+            for (const q of guest?.moduleRolesQualifiedNames ?? []) ctx.tiers.guest.add(q);
+
+            // 관리자 역할을 못 찾았거나, 게스트를 켜 놓고 그 역할을 못 찾았으면
+            // 등급 판정의 근거가 불완전하다. 그 경우 등급으로 점수를 깎지 않는다.
+            ctx.tiers.resolved =
+                admin !== undefined && (!sec.enableGuestAccess || guest !== undefined);
+            if (!ctx.tiers.resolved) {
+                console.log(
+                    `⚠️ [Domain] 역할 등급 판정 근거 부족 (관리자 역할 '${sec.adminUserRoleName}' 확인 실패) — D005 등급을 낮추지 않습니다.`
+                );
+            }
+            return ctx;
         } catch {
             /* 무시 */
         }
     }
-    return null;
+    return ctx;
 }
 
 /** graph.ts와 판정이 갈리면 D003과 L001이 서로 다른 얘기를 하게 된다. 한 곳에서 가져온다. */
@@ -25,7 +156,7 @@ const isPersistable = isPersistableEntity;
 export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<ReviewIssue[]> {
     console.log("🔍 [Domain] 데이터 구조·보안·의존성 분석 시작...");
 
-    const securityLevel = await readSecurityLevel(model);
+    const { level: securityLevel, tiers } = await readSecurityContext(model);
     const securityIsOn = securityLevel !== security.SecurityLevel.CheckNothing;
     const securityNote = `프로젝트 보안 수준: ${securityLevel?.name ?? "확인 불가"}`;
 
@@ -238,32 +369,91 @@ export async function analyzeDomain(model: IModel, graph: ModelGraph): Promise<R
                         }
                     );
                 } else {
-                    const openReads = entity.accessRules.filter(
-                        (rule) =>
-                            rule.defaultMemberAccessRights !== domainmodels.MemberAccessRights.None &&
-                            (!rule.xPathConstraint || rule.xPathConstraint.trim() === "")
-                    );
-                    if (openReads.length > 0) {
-                        const roles = openReads
-                            .flatMap((r) => r.moduleRolesQualifiedNames ?? [])
-                            .slice(0, 5);
+                    // XPath 제약이 없는 규칙 = 그 역할이 이 엔티티의 전체 행을 본다.
+                    const open = entity.accessRules
+                        .filter((r) => !r.xPathConstraint || r.xPathConstraint.trim() === "")
+                        .map((r) => {
+                            const roleQNames = r.moduleRolesQualifiedNames ?? [];
+                            return {
+                                roleQNames,
+                                tier: classifyAccessTier(roleQNames, tiers),
+                                grant: accessGrant({
+                                    defaultRights: rightsOf(r.defaultMemberAccessRights),
+                                    memberRights: r.memberAccesses.map((m) =>
+                                        rightsOf(m.accessRights)
+                                    ),
+                                    allowDelete: r.allowDelete,
+                                }),
+                            };
+                        })
+                        .filter((r) => r.grant.grants);
+
+                    if (open.length > 0) {
+                        // 엔티티당 이슈는 하나다. 여러 규칙이 열려 있으면 **가장 위험한 쪽**이
+                        // 이 엔티티의 성격이다. 평균이나 다수결로 뭉개면 사고가 묻힌다.
+                        const worst = open.reduce((a, b) =>
+                            TIER_WEIGHT[b.tier] > TIER_WEIGHT[a.tier] ||
+                            (TIER_WEIGHT[b.tier] === TIER_WEIGHT[a.tier] &&
+                                b.grant.writes &&
+                                !a.grant.writes)
+                                ? b
+                                : a
+                        );
+                        const writes = open.some((r) => r.grant.writes);
+                        const roles = [...new Set(open.flatMap((r) => r.roleQNames))];
+
+                        const severity = accessSeverity(worst.tier);
+
+                        const evidence = [
+                            securityNote,
+                            `열린 대상: ${TIER_LABEL[worst.tier]} — ${roles.join(", ") || "역할 미지정"}`,
+                            `허용 범위: ${worst.grant.label}`,
+                            usageLine,
+                        ];
+                        if (worst.tier === "unknown") {
+                            evidence.push(
+                                tiers.resolved
+                                    ? "⚠️ 이 규칙에 모듈 역할이 지정되어 있지 않아 대상을 특정하지 못했습니다. 등급을 낮추지 않습니다."
+                                    : "⚠️ 프로젝트 보안에서 관리자·게스트 역할을 읽지 못해 등급을 판정하지 못했습니다. 등급을 낮추지 않습니다."
+                            );
+                        }
+
                         add(
                             "UNCONSTRAINED_ACCESS",
                             qName,
-                            `XPath 제약 없는 접근 규칙이 ${openReads.length}건 있습니다. 해당 역할은 전체 행을 봅니다.`,
-                            "Warning",
-                            [
-                                securityNote,
-                                roles.length > 0 ? `대상 역할: ${roles.join(", ")}` : "역할 미지정",
-                                usageLine,
-                            ],
+                            worst.tier === "guest"
+                                ? `비로그인(익명) 사용자가 이 엔티티의 전체 행을 봅니다. (무제약 규칙 ${open.length}건)`
+                                : worst.tier === "adminOnly"
+                                  ? `관리자 역할만 전체 행을 봅니다. 의도된 설정이면 기각하세요. (무제약 규칙 ${open.length}건)`
+                                  : `XPath 제약 없는 접근 규칙이 ${open.length}건 있습니다. 해당 역할은 전체 행을 봅니다.`,
+                            severity,
+                            evidence,
                             {
+                                score:
+                                    Math.round(
+                                        (MendixRules.UNCONSTRAINED_ACCESS.baseScore *
+                                            TIER_WEIGHT[worst.tier]) /
+                                            TIER_WEIGHT.general
+                                    ) + (writes ? 8 : 0),
+                                recommendation:
+                                    worst.tier === "guest"
+                                        ? "익명 접근에 전체 행이 열려 있습니다. 공개해도 되는 데이터가 맞는지 먼저 확인하고, 아니라면 XPath 제약을 추가하거나 익명 역할에서 이 규칙을 빼세요."
+                                        : worst.tier === "adminOnly"
+                                          ? "관리자 전용이라면 대개 의도된 설정입니다. 의도가 맞다면 Access Rule의 Documentation에 이유를 적어 두세요 — 다음 리뷰에서 같은 건을 다시 검토하지 않게 됩니다."
+                                          : undefined,
                                 facts: {
-                                    "열린 규칙": String(openReads.length),
+                                    "열린 대상": TIER_LABEL[worst.tier],
+                                    허용: worst.grant.label,
+                                    "열린 규칙": String(open.length),
                                     "사용 flow": String(touchCount),
-                                    역할: roles.length > 0 ? roles.join(", ") : "미지정",
+                                    역할: roles.slice(0, 5).join(", ") || "미지정",
                                 },
-                                focusRank: touchCount * 10 + openReads.length,
+                                // 등급이 먼저, 그다음 쓰기 여부, 그다음 노출 반경.
+                                focusRank:
+                                    TIER_WEIGHT[worst.tier] * 10000 +
+                                    (writes ? 1000 : 0) +
+                                    touchCount * 10 +
+                                    open.length,
                             }
                         );
                     }
